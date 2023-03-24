@@ -1,0 +1,124 @@
+server:
+  extraArgs:
+    - --insecure
+  ingress:
+    enabled: true
+    hosts:
+      - argocd.k3s.bakito.net
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      cert-manager.io/issuer-kind: ClusterIssuer
+      traefik.ingress.kubernetes.io/router.middlewares: argocd-redirect@kubernetescrd
+    tls:
+      - hosts:
+          - argocd.k3s.bakito.net
+        secretName: tls-argocd-ingress
+
+configs:
+  rbac:
+    policy.default: admin
+  cm:
+    url: https://foo.bar/
+    admin.enabled: false
+    users.anonymous.enabled: true
+  cmp:
+    create: true
+    plugins:
+      avp:
+        allowConcurrency: true
+        discover:
+          find:
+            command:
+              - sh
+              - "-c"
+              - "find . -name '*.yaml' | xargs -I {} grep \"<path\\|avp\\.kubernetes\\.io\" {} | grep ."
+        generate:
+          command:
+            - argocd-vault-plugin
+            - generate
+            - "."
+        lockRepo: false
+
+
+      avp-helm:
+        allowConcurrency: true
+        discover:
+          find:
+            command:
+              - sh
+              - "-c"
+              - "find . -name 'Chart.yaml' && find . -name 'values.yaml'"
+        generate:
+          command:
+            - sh
+            - "-c"
+            - |
+              helm template $ARGOCD_APP_NAME --include-crds -n $ARGOCD_APP_NAMESPACE -f <(echo "$ARGOCD_ENV_helm_values") ${ARGOCD_ENV_HELM_ARGS} . |
+              argocd-vault-plugin generate -
+
+
+        lockRepo: false
+
+repoServer:
+  initContainers:
+    - name: download-tools
+      image: alpine/helm:3.11.2
+      env:
+        - name: AVP_VERSION
+          value: 1.11.0
+      command: [ sh, -c ]
+      args:
+        - >-
+          curl -L https://github.com/argoproj-labs/argocd-vault-plugin/releases/download/v$(AVP_VERSION)/argocd-vault-plugin_$(AVP_VERSION)_linux_amd64 -o argocd-vault-plugin &&
+          chmod +x argocd-vault-plugin &&
+          mv argocd-vault-plugin /custom-tools/ &&
+          cp /usr/bin/helm /custom-tools/
+      volumeMounts:
+        - mountPath: /custom-tools
+          name: custom-tools
+
+  extraContainers:
+    - name: avp
+      command: [ /var/run/argocd/argocd-cmp-server ]
+      image: registry.access.redhat.com/ubi8
+      env:
+        - name: VAULT_ADDR
+          value: http://foo.bar:8200
+        - name: VAULT_TOKEN
+          value: xxx
+        - name: AVP_TYPE
+          value: vault
+        - name: AVP_AUTH_TYPE
+          value: token
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+      volumeMounts:
+        - mountPath: /var/run/argocd
+          name: var-files
+        - mountPath: /home/argocd/cmp-server/plugins
+          name: plugins
+        - mountPath: /tmp
+          name: tmp
+
+        # Register plugins into sidecar
+        - mountPath: /home/argocd/cmp-server/config/plugin.yaml
+          subPath: avp-helm.yaml
+          name: cmp-plugin
+
+        # Important: Mount tools into $PATH
+        - name: custom-tools
+          subPath: argocd-vault-plugin
+          mountPath: /usr/local/bin/argocd-vault-plugin
+
+        - name: custom-tools
+          subPath: helm
+          mountPath: /usr/local/bin/helm
+
+  volumes:
+    - configMap:
+        name: argocd-cmp-cm
+      name: cmp-plugin
+    - name: custom-tools
+      emptyDir: { }
